@@ -34,6 +34,123 @@ import yaml  # noqa: F401
 from ..common import ERROR, parse_yolo_line  # noqa: F401
 
 
+_DROP_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+_REMOVE_CODES = {"LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+
+
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    errors = [i for i in issues if i.severity == ERROR]
+    fixes = []
+    removed = set()
+
+    for i in errors:
+        if i.code.startswith("DUP_IMAGE_") or i.code in _REMOVE_CODES:
+            if i.image in removed:
+                continue
+            removed.add(i.image)
+            ip = ds.image_path(i.image)
+            if ip and ip.exists():
+                ip.unlink()
+            lp = ds.label_path(i.image)
+            if lp.exists():
+                lp.unlink()
+            fixes.append({
+                "image": i.image,
+                "line": "",
+                "action": "remove_image",
+                "before": i.code,
+                "after": "(đã xoá)",
+            })
+
+    if any(i.code == "BAD_CLASS_NAME" for i in errors) and ds.yaml_path.exists():
+        data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+        before = str(data.get("names", ""))
+        data["names"] = list(cfg["classes"])
+        ds.yaml_path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        fixes.append({
+            "image": "data.yaml",
+            "line": "",
+            "action": "rename_classes",
+            "before": before,
+            "after": str(data["names"]),
+        })
+
+    for i in errors:
+        if i.code == "MISSING_LABEL_FILE" and i.image not in removed:
+            fixes.append({
+                "image": i.image,
+                "line": "",
+                "action": "needs_label",
+                "before": "(không có file)",
+                "after": "chuyển người gán",
+            })
+
+    per_file_drop = defaultdict(set)
+    per_file_clip = defaultdict(set)
+    for i in errors:
+        if i.image in removed or i.line is None:
+            continue
+        if i.code in _DROP_CODES:
+            per_file_drop[i.image].add(i.line)
+        elif i.code == "BOX_OUT_OF_IMAGE":
+            per_file_clip[i.image].add(i.line)
+
+    for stem in sorted(set(per_file_drop) | set(per_file_clip)):
+        lp = ds.label_path(stem)
+        if not lp.exists():
+            continue
+        raw_lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
+        drop_lines = per_file_drop[stem]
+        clip_lines = per_file_clip[stem]
+        new_lines = []
+        for idx, text in enumerate(raw_lines, 1):
+            if idx in drop_lines:
+                fixes.append({
+                    "image": stem,
+                    "line": idx,
+                    "action": "drop_line",
+                    "before": text,
+                    "after": "(đã xoá)",
+                })
+                continue
+            if idx in clip_lines:
+                try:
+                    cid, cx, cy, w, h = parse_yolo_line(text)
+                except ValueError:
+                    fixes.append({
+                        "image": stem,
+                        "line": idx,
+                        "action": "drop_line",
+                        "before": text,
+                        "after": "(đã xoá)",
+                    })
+                    continue
+                x1 = max(0.0, min(1.0, cx - w / 2))
+                y1 = max(0.0, min(1.0, cy - h / 2))
+                x2 = max(0.0, min(1.0, cx + w / 2))
+                y2 = max(0.0, min(1.0, cy + h / 2))
+                nw, nh = x2 - x1, y2 - y1
+                if nw <= 0 or nh <= 0:
+                    fixes.append({
+                        "image": stem,
+                        "line": idx,
+                        "action": "drop_line",
+                        "before": text,
+                        "after": "(đã xoá: ngoài ảnh)",
+                    })
+                    continue
+                ncx, ncy = (x1 + x2) / 2, (y1 + y2) / 2
+                after = f"{cid} {ncx:.6f} {ncy:.6f} {nw:.6f} {nh:.6f}"
+                fixes.append({
+                    "image": stem,
+                    "line": idx,
+                    "action": "clip_box",
+                    "before": text,
+                    "after": after,
+                })
+                new_lines.append(after)
+            else:
+                new_lines.append(text)
+        lp.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+
+    return fixes
